@@ -189,6 +189,7 @@ jobs:
             python .github/scripts/github-integration.py \
               --token ${GH_PAT} \
               --repo ${SOURCE_REPO} \
+              --action apply-fix \
               --fix-file fix-result.json \
               --source-dir ../source-repo \
               --branch-name ${BRANCH_NAME} \
