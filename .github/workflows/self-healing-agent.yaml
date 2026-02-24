@@ -96,11 +96,25 @@ jobs:
           SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
         run: |
           # Extract branch name from ref
-          BRANCH_NAME=$(echo "$SOURCE_REF" | sed 's|refs/heads/||')
-          
-          git clone --depth 1 --branch "$BRANCH_NAME" \
-            https://${GH_PAT}@github.com/${SOURCE_REPO}.git \
-            source-repo
+          # Handle both refs/heads/branch and refs/pull/N/merge formats
+          if [[ "$SOURCE_REF" == refs/pull/* ]]; then
+            # For PR refs, extract the PR number and fetch the head branch
+            PR_NUM=$(echo "$SOURCE_REF" | sed 's|refs/pull/\([0-9]*\)/.*|\1|')
+            
+            # Clone the repo first
+            git clone --depth 1 https://${GH_PAT}@github.com/${SOURCE_REPO}.git source-repo
+            cd source-repo
+            
+            # Fetch the PR
+            git fetch origin pull/${PR_NUM}/head:pr-${PR_NUM}
+            git checkout pr-${PR_NUM}
+          else
+            # Normal branch ref
+            BRANCH_NAME=$(echo "$SOURCE_REF" | sed 's|refs/heads/||')
+            git clone --depth 1 --branch "$BRANCH_NAME" \
+              https://${GH_PAT}@github.com/${SOURCE_REPO}.git \
+              source-repo
+          fi
 
       - name: Run Self-Healing Loop
         id: healing
