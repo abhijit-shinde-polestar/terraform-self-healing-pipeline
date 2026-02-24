@@ -342,32 +342,27 @@ def main():
             if not fix_data.get("success"):
                 result = {"success": False, "message": "Fix data indicates failure"}
             else:
-                # Create branch
-                success, msg = gh.create_branch(args.source_dir, args.branch_name, args.base_branch)
+                # Apply changes directly to current branch (no new branch creation)
+                changes = fix_data.get("fix", {}).get("changes", [])
+                success, msg, files = gh.apply_changes(args.source_dir, changes)
+                
                 if not success:
                     result = {"success": False, "message": msg}
                 else:
-                    # Apply changes
-                    changes = fix_data.get("fix", {}).get("changes", [])
-                    success, msg, files = gh.apply_changes(args.source_dir, changes)
+                    # Commit and push to the same branch
+                    success, msg, commit_sha = gh.commit_and_push(
+                        args.source_dir, args.commit_message, files, args.branch_name
+                    )
                     
-                    if not success:
-                        result = {"success": False, "message": msg}
+                    if success:
+                        result = {
+                            "success": True,
+                            "message": msg,
+                            "commit_sha": commit_sha,
+                            "files_modified": files
+                        }
                     else:
-                        # Commit and push
-                        success, msg, commit_sha = gh.commit_and_push(
-                            args.source_dir, args.commit_message, files, args.branch_name
-                        )
-                        
-                        if success:
-                            result = {
-                                "success": True,
-                                "message": msg,
-                                "commit_sha": commit_sha,
-                                "files_modified": files
-                            }
-                        else:
-                            result = {"success": False, "message": msg}
+                        result = {"success": False, "message": msg}
         
         elif args.action == "trigger-workflow":
             inputs = json.loads(args.inputs) if args.inputs else {}
