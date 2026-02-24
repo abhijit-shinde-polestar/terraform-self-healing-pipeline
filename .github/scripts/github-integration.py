@@ -277,41 +277,109 @@ class GitHubIntegration:
 
 
 def main():
-    """Main entry point for testing"""
+    """Main entry point"""
     import argparse
     
     parser = argparse.ArgumentParser(description="GitHub integration for self-healing")
     parser.add_argument("--token", required=True, help="GitHub token")
     parser.add_argument("--repo", required=True, help="Source repository (owner/repo)")
-    parser.add_argument("--action", required=True, choices=["clone", "create-branch", "trigger-workflow"])
-    parser.add_argument("--ref", default="main", help="Git reference")
-    parser.add_argument("--branch", help="Branch name")
+    parser.add_argument("--action", required=True, 
+                       choices=["apply-fix", "trigger-workflow", "check-workflow", "create-pr"])
+    parser.add_argument("--fix-file", help="Path to fix JSON file")
+    parser.add_argument("--source-dir", help="Path to source repository")
+    parser.add_argument("--branch-name", help="Branch name")
+    parser.add_argument("--base-branch", help="Base branch name")
+    parser.add_argument("--commit-message", help="Commit message")
     parser.add_argument("--workflow", help="Workflow ID or filename")
+    parser.add_argument("--ref", help="Git reference")
+    parser.add_argument("--inputs", help="Workflow inputs as JSON string")
+    parser.add_argument("--branch", help="Branch to check")
+    parser.add_argument("--head", help="PR head branch")
+    parser.add_argument("--base", help="PR base branch")
+    parser.add_argument("--title", help="PR title")
+    parser.add_argument("--body", help="PR body")
+    parser.add_argument("--output", help="Output file for results")
     
     args = parser.parse_args()
     
     gh = GitHubIntegration(args.token, args.repo)
+    result = {}
     
-    if args.action == "clone":
-        success, msg = gh.clone_repo("/tmp/test-clone", args.ref)
-        print(msg)
-        sys.exit(0 if success else 1)
+    try:
+        if args.action == "apply-fix":
+            # Load fix file
+            with open(args.fix_file, 'r') as f:
+                fix_data = json.load(f)
+            
+            if not fix_data.get("success"):
+                result = {"success": False, "message": "Fix data indicates failure"}
+            else:
+                # Create branch
+                success, msg = gh.create_branch(args.source_dir, args.branch_name, args.base_branch)
+                if not success:
+                    result = {"success": False, "message": msg}
+                else:
+                    # Apply changes
+                    changes = fix_data.get("fix", {}).get("changes", [])
+                    success, msg, files = gh.apply_changes(args.source_dir, changes)
+                    
+                    if not success:
+                        result = {"success": False, "message": msg}
+                    else:
+                        # Commit and push
+                        success, msg, commit_sha = gh.commit_and_push(
+                            args.source_dir, args.commit_message, files, args.branch_name
+                        )
+                        
+                        if success:
+                            result = {
+                                "success": True,
+                                "message": msg,
+                                "commit_sha": commit_sha,
+                                "files_modified": files
+                            }
+                        else:
+                            result = {"success": False, "message": msg}
+        
+        elif args.action == "trigger-workflow":
+            inputs = json.loads(args.inputs) if args.inputs else {}
+            success, msg = gh.trigger_workflow(args.workflow, args.ref, inputs)
+            result = {"success": success, "message": msg}
+        
+        elif args.action == "check-workflow":
+            runs = gh.get_workflow_runs(args.workflow, args.branch, limit=1)
+            if runs:
+                run = runs[0]
+                result = {
+                    "success": run["conclusion"] == "success",
+                    "status": run["status"],
+                    "conclusion": run.get("conclusion"),
+                    "run_id": run["id"]
+                }
+            else:
+                result = {"success": False, "message": "No workflow runs found"}
+        
+        elif args.action == "create-pr":
+            success, msg, pr_number = gh.create_pull_request(
+                args.title, args.head, args.base, args.body
+            )
+            result = {"success": success, "message": msg, "pr_number": pr_number}
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(result, f, indent=2)
+        
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result.get("success", False) else 1)
     
-    elif args.action == "create-branch":
-        if not args.branch:
-            print("--branch required")
-            sys.exit(1)
-        success, msg = gh.create_branch("/tmp/test-clone", args.branch)
-        print(msg)
-        sys.exit(0 if success else 1)
-    
-    elif args.action == "trigger-workflow":
-        if not args.workflow:
-            print("--workflow required")
-            sys.exit(1)
-        success, msg = gh.trigger_workflow(args.workflow, args.ref)
-        print(msg)
-        sys.exit(0 if success else 1)
+    except Exception as e:
+        error_result = {"success": False, "message": str(e)}
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(error_result, f, indent=2)
+        print(json.dumps(error_result, indent=2))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

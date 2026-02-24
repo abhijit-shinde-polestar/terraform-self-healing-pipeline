@@ -62,7 +62,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           SOURCE_REPO: ${{ github.event.client_payload.source_repo || inputs.source_repo }}
           RUN_ID: ${{ github.event.client_payload.run_id || github.run_id }}
-          ARTIFACT_NAME: ${{ github.event.client_payload.error_log_artifact || inputs.error_log_artifact }}
+          ARTIFACT_NAME: ${{ github.event.client_payload.artifact_name || inputs.error_log_artifact }}
         run: |
           # Download artifact from source repo using GitHub API
           mkdir -p error-logs
@@ -109,9 +109,9 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           SOURCE_REPO: ${{ github.event.client_payload.source_repo || inputs.source_repo }}
           SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
-          TERRAGRUNT_PATH: ${{ github.event.client_payload.terragrunt_path || inputs.terragrunt_path }}
+          TERRAGRUNT_PATH: ${{ github.event.client_payload.workload_path || inputs.terragrunt_path }}
           ENVIRONMENT: ${{ github.event.client_payload.environment || inputs.environment }}
-          WORKFLOW_TO_TRIGGER: ${{ github.event.client_payload.workflow_to_trigger || inputs.workflow_to_trigger || 'terragrunt-deployment.yaml' }}
+          WORKFLOW_TO_TRIGGER: ${{ github.event.client_payload.workflow_name || inputs.workflow_to_trigger || 'terragrunt-deployment.yaml' }}
           MAX_ATTEMPTS: ${{ github.event.client_payload.max_attempts || inputs.max_attempts || 5 }}
           MIN_CONFIDENCE: ${{ github.event.client_payload.min_confidence || inputs.min_confidence || 0.7 }}
         run: |
@@ -140,9 +140,22 @@ jobs:
             
             # Analyze error with AI
             echo "🔍 Analyzing error with AI..."
+            
+            # Find the error log file
+            ERROR_LOG_FILE=$(find ../error-logs -name "*.log" -type f | head -n 1)
+            if [ -z "$ERROR_LOG_FILE" ]; then
+              echo "❌ No error log file found"
+              exit 1
+            fi
+            
+            echo "Using error log: $ERROR_LOG_FILE"
+            
+            # Get the directory containing the terragrunt config
+            CONTEXT_DIR=$(dirname "../source-repo/${TERRAGRUNT_PATH}")
+            
             python .github/scripts/ai-healing-agent.py \
-              --error-log ../error-logs/deployment-error.log \
-              --context-dir ../source-repo/${TERRAGRUNT_PATH} \
+              --error-log "$ERROR_LOG_FILE" \
+              --context-dir "$CONTEXT_DIR" \
               --output fix-result.json \
               --min-confidence ${MIN_CONFIDENCE}
             
