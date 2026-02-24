@@ -77,7 +77,34 @@ class GitHubIntegration:
         
         try:
             for change in changes:
-                file_path = os.path.join(repo_dir, change["file"])
+                # Handle both absolute and relative file paths
+                file_rel_path = change["file"]
+                
+                # If the path doesn't start with repo_dir, it's a relative path
+                if not file_rel_path.startswith(repo_dir):
+                    # Try to find the file in the repo
+                    file_path = None
+                    for root, dirs, files in os.walk(repo_dir):
+                        if os.path.basename(file_rel_path) in files:
+                            potential_path = os.path.join(root, os.path.basename(file_rel_path))
+                            # Verify this is the right file by checking if it contains the old content
+                            if change["action"] == "replace":
+                                try:
+                                    with open(potential_path, 'r') as f:
+                                        if change["old_content"] in f.read():
+                                            file_path = potential_path
+                                            break
+                                except:
+                                    continue
+                            else:
+                                file_path = potential_path
+                                break
+                    
+                    if not file_path:
+                        return False, f"Could not find file: {file_rel_path} in {repo_dir}", modified_files
+                else:
+                    file_path = file_rel_path
+                
                 action = change["action"]
                 
                 if action == "replace":
@@ -96,7 +123,8 @@ class GitHubIntegration:
                 if not success:
                     return False, msg, modified_files
                 
-                modified_files.append(change["file"])
+                # Store relative path from repo root for git operations
+                modified_files.append(os.path.relpath(file_path, repo_dir))
             
             return True, f"Applied {len(changes)} change(s)", modified_files
         
