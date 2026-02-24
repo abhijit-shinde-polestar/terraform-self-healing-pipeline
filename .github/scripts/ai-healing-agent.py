@@ -97,7 +97,7 @@ class TerraformErrorAnalyzer:
     
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-3-5-sonnet-20241022"
+        self.model = "claude-sonnet-4-20250514"  # Claude Sonnet 4.5
     
     def analyze_error(self, error_output: str, context_files: Dict[str, str]) -> ErrorContext:
         """Analyze error output and generate fix using Claude"""
