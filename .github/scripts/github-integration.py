@@ -312,7 +312,7 @@ def main():
     parser.add_argument("--token", required=True, help="GitHub token")
     parser.add_argument("--repo", required=True, help="Source repository (owner/repo)")
     parser.add_argument("--action", required=True, 
-                       choices=["apply-fix", "trigger-workflow", "check-workflow", "create-pr"])
+                       choices=["apply-fix", "trigger-workflow", "check-workflow", "check-latest-workflow", "create-pr"])
     parser.add_argument("--fix-file", help="Path to fix JSON file")
     parser.add_argument("--source-dir", help="Path to source repository")
     parser.add_argument("--branch-name", help="Branch name")
@@ -377,10 +377,41 @@ def main():
                     "success": run["conclusion"] == "success",
                     "status": run["status"],
                     "conclusion": run.get("conclusion"),
-                    "run_id": run["id"]
+                    "run_id": run["id"],
+                    "html_url": run.get("html_url")
                 }
             else:
                 result = {"success": False, "message": "No workflow runs found"}
+        
+        elif args.action == "check-latest-workflow":
+            # Get the latest workflow run for the branch (any workflow)
+            url = f"{gh.api_base}/repos/{gh.source_repo}/actions/runs"
+            params = {
+                "branch": args.branch,
+                "per_page": 5,
+                "event": "push"  # Only check push events (not PR events)
+            }
+            
+            response = requests.get(url, headers=gh.headers, params=params)
+            
+            if response.status_code == 200:
+                runs = response.json().get("workflow_runs", [])
+                if runs:
+                    # Get the most recent run
+                    run = runs[0]
+                    result = {
+                        "success": run["conclusion"] == "success" if run["conclusion"] else False,
+                        "status": run["status"],
+                        "conclusion": run.get("conclusion"),
+                        "run_id": run["id"],
+                        "html_url": run.get("html_url"),
+                        "workflow_name": run.get("name"),
+                        "created_at": run.get("created_at")
+                    }
+                else:
+                    result = {"success": False, "message": "No workflow runs found for branch"}
+            else:
+                result = {"success": False, "message": f"API error: {response.status_code}"}
         
         elif args.action == "create-pr":
             success, msg, pr_number = gh.create_pull_request(
@@ -394,7 +425,13 @@ def main():
                 json.dump(result, f, indent=2)
         
         print(json.dumps(result, indent=2))
-        sys.exit(0 if result.get("success", False) else 1)
+        
+        # For check-latest-workflow, exit 0 if we found a run (even if it's not successful yet)
+        # Exit 1 only if we couldn't find any run
+        if args.action == "check-latest-workflow":
+            sys.exit(0 if "status" in result else 1)
+        else:
+            sys.exit(0 if result.get("success", False) else 1)
     
     except Exception as e:
         error_result = {"success": False, "message": str(e)}

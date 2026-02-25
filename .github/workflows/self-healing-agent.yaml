@@ -207,50 +207,58 @@ jobs:
             
             echo "✅ Fixes applied and pushed to branch: $BRANCH_NAME"
             
-            # Trigger deployment workflow in source repo
-            echo "🚀 Triggering deployment workflow in source repo..."
-            python .github/scripts/github-integration.py \
-              --token ${GH_PAT} \
-              --repo ${SOURCE_REPO} \
-              --action trigger-workflow \
-              --workflow ${WORKFLOW_TO_TRIGGER} \
-              --ref ${BRANCH_NAME} \
-              --inputs '{"environment":"'${ENVIRONMENT}'","terragrunt_path":"'${TERRAGRUNT_PATH}'","triggered_by":"self-healing-agent"}'
+            # Push triggers the workflow automatically (no need to manually trigger)
+            echo "✅ Fix pushed to ${BRANCH_NAME} - workflow will auto-trigger"
             
-            # Wait for workflow to complete with proper polling
-            echo "⏳ Waiting for deployment to complete..."
-            sleep 30  # Give workflow time to start
+            # Wait for workflow to start
+            echo "⏳ Waiting for deployment workflow to start..."
+            sleep 45  # Give workflow time to start (increased for job-based workflows)
             
-            # Poll for workflow completion (max 10 minutes)
+            # Poll for workflow completion (max 15 minutes for job-based workflows)
             POLL_COUNT=0
-            MAX_POLLS=20  # 20 * 30s = 10 minutes
+            MAX_POLLS=30  # 30 * 30s = 15 minutes
             WORKFLOW_COMPLETED=false
+            WORKFLOW_FOUND=false
             
             while [ $POLL_COUNT -lt $MAX_POLLS ]; do
               python .github/scripts/github-integration.py \
                 --token ${GH_PAT} \
                 --repo ${SOURCE_REPO} \
-                --action check-workflow \
+                --action check-latest-workflow \
                 --branch ${BRANCH_NAME} \
-                --workflow ${WORKFLOW_TO_TRIGGER} \
                 --output workflow-status.json
               
-              WORKFLOW_STATUS=$(jq -r '.status' workflow-status.json)
-              WORKFLOW_CONCLUSION=$(jq -r '.conclusion' workflow-status.json)
+              CHECK_RESULT=$?
               
-              echo "Poll $((POLL_COUNT + 1))/$MAX_POLLS: Status=$WORKFLOW_STATUS, Conclusion=$WORKFLOW_CONCLUSION"
-              
-              if [ "$WORKFLOW_STATUS" = "completed" ]; then
-                WORKFLOW_COMPLETED=true
-                break
+              if [ $CHECK_RESULT -eq 0 ]; then
+                WORKFLOW_FOUND=true
+                WORKFLOW_STATUS=$(jq -r '.status' workflow-status.json)
+                WORKFLOW_CONCLUSION=$(jq -r '.conclusion' workflow-status.json)
+                RUN_URL=$(jq -r '.html_url' workflow-status.json)
+                
+                echo "Poll $((POLL_COUNT + 1))/$MAX_POLLS: Status=$WORKFLOW_STATUS, Conclusion=$WORKFLOW_CONCLUSION"
+                echo "Run URL: $RUN_URL"
+                
+                if [ "$WORKFLOW_STATUS" = "completed" ]; then
+                  WORKFLOW_COMPLETED=true
+                  break
+                fi
+              else
+                echo "Poll $((POLL_COUNT + 1))/$MAX_POLLS: Waiting for workflow to start..."
               fi
               
               sleep 30
               POLL_COUNT=$((POLL_COUNT + 1))
             done
             
+            if [ "$WORKFLOW_FOUND" = "false" ]; then
+              echo "⚠️  No workflow run detected - may not have triggered"
+              continue  # Try next attempt
+            fi
+            
             if [ "$WORKFLOW_COMPLETED" = "false" ]; then
-              echo "⏱️  Workflow timeout - deployment did not complete in time"
+              echo "⏱️  Workflow timeout - deployment did not complete in 15 minutes"
+              echo "This may indicate the workflow is stuck or taking too long"
               continue  # Try next attempt
             fi
             
@@ -258,11 +266,13 @@ jobs:
             if [ "$WORKFLOW_CONCLUSION" = "success" ]; then
               echo "🎉 Deployment successful!"
               echo "✅ Fix applied to branch ${BRANCH_NAME} and deployment verified"
+              echo "All jobs (plan + apply) completed successfully"
               SUCCESS=true
               break
             else
               echo "⚠️  Deployment failed with conclusion: $WORKFLOW_CONCLUSION"
-              echo "Will retry with next attempt..."
+              echo "One or more jobs (plan/apply) failed"
+              echo "Will analyze new errors and retry with next attempt..."
               
               # Download new error logs for next iteration
               if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
@@ -270,12 +280,15 @@ jobs:
                 # Get the failed run ID
                 FAILED_RUN_ID=$(jq -r '.run_id' workflow-status.json)
                 
-                # Download new artifact
+                # Wait a bit for artifacts to be uploaded
+                sleep 10
+                
+                # Download new artifact (could be from plan or apply job)
                 ARTIFACT_URL=$(curl -s \
                   -H "Authorization: token ${GH_PAT}" \
                   -H "Accept: application/vnd.github.v3+json" \
                   "https://api.github.com/repos/${SOURCE_REPO}/actions/runs/${FAILED_RUN_ID}/artifacts" \
-                  | jq -r ".artifacts[] | select(.name | startswith(\"deployment-error-logs\")) | .archive_download_url" | head -n 1)
+                  | jq -r ".artifacts[] | select(.name | contains(\"error-logs\")) | .archive_download_url" | head -n 1)
                 
                 if [ -n "$ARTIFACT_URL" ] && [ "$ARTIFACT_URL" != "null" ]; then
                   rm -rf ../error-logs/*
@@ -285,9 +298,30 @@ jobs:
                     "${ARTIFACT_URL}" \
                     -o ../error-logs/artifact.zip
                   unzip -q -o ../error-logs/artifact.zip -d ../error-logs
-                  echo "✅ Downloaded new error logs"
+                  echo "✅ Downloaded new error logs from failed job"
                 else
-                  echo "⚠️  Could not download new error logs, will use previous analysis"
+                  echo "⚠️  Could not download new error logs"
+                  echo "Checking if artifacts are still being uploaded..."
+                  sleep 15
+                  # Try one more time
+                  ARTIFACT_URL=$(curl -s \
+                    -H "Authorization: token ${GH_PAT}" \
+                    -H "Accept: application/vnd.github.v3+json" \
+                    "https://api.github.com/repos/${SOURCE_REPO}/actions/runs/${FAILED_RUN_ID}/artifacts" \
+                    | jq -r ".artifacts[] | select(.name | contains(\"error-logs\")) | .archive_download_url" | head -n 1)
+                  
+                  if [ -n "$ARTIFACT_URL" ] && [ "$ARTIFACT_URL" != "null" ]; then
+                    rm -rf ../error-logs/*
+                    curl -L \
+                      -H "Authorization: token ${GH_PAT}" \
+                      -H "Accept: application/vnd.github.v3+json" \
+                      "${ARTIFACT_URL}" \
+                      -o ../error-logs/artifact.zip
+                    unzip -q -o ../error-logs/artifact.zip -d ../error-logs
+                    echo "✅ Downloaded new error logs (retry)"
+                  else
+                    echo "❌ Failed to download new error logs, will retry with previous analysis"
+                  fi
                 fi
               fi
             fi
