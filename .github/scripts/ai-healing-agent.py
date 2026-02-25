@@ -176,11 +176,29 @@ Respond in JSON format:
     def _parse_ai_response(self, ai_response: str, raw_output: str) -> ErrorContext:
         """Parse AI response into ErrorContext"""
         try:
-            json_match = re.search(r'\{.*\}', ai_response, re.DOTALL)
-            if not json_match:
+            # Try to find JSON block with proper nesting handling
+            # Look for the first { and find its matching }
+            start_idx = ai_response.find('{')
+            if start_idx == -1:
                 raise ValueError("No JSON found in AI response")
             
-            data = json.loads(json_match.group())
+            # Count braces to find the matching closing brace
+            brace_count = 0
+            end_idx = -1
+            for i in range(start_idx, len(ai_response)):
+                if ai_response[i] == '{':
+                    brace_count += 1
+                elif ai_response[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            
+            if end_idx == -1:
+                raise ValueError("Could not find matching closing brace for JSON")
+            
+            json_str = ai_response[start_idx:end_idx]
+            data = json.loads(json_str)
             
             return ErrorContext(
                 category=ErrorCategory(data.get("category", "unknown")),
@@ -188,6 +206,17 @@ Respond in JSON format:
                 affected_files=data.get("affected_files", []),
                 suggested_fix=json.dumps(data.get("fix", {}), indent=2),
                 confidence=float(data.get("confidence", 0.5)),
+                raw_output=raw_output
+            )
+        except json.JSONDecodeError as e:
+            print(f"Error parsing AI response JSON: {e}")
+            print(f"Attempted to parse: {json_str[:200] if 'json_str' in locals() else 'N/A'}...")
+            return ErrorContext(
+                category=ErrorCategory.UNKNOWN,
+                error_message="Failed to parse AI response - invalid JSON",
+                affected_files=[],
+                suggested_fix="",
+                confidence=0.0,
                 raw_output=raw_output
             )
         except Exception as e:
