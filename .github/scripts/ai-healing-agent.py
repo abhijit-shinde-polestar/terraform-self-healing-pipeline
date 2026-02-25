@@ -176,29 +176,54 @@ Respond in JSON format:
     def _parse_ai_response(self, ai_response: str, raw_output: str) -> ErrorContext:
         """Parse AI response into ErrorContext"""
         try:
-            # Try to find JSON block with proper nesting handling
-            # Look for the first { and find its matching }
-            start_idx = ai_response.find('{')
-            if start_idx == -1:
-                raise ValueError("No JSON found in AI response")
-            
-            # Count braces to find the matching closing brace
-            brace_count = 0
-            end_idx = -1
-            for i in range(start_idx, len(ai_response)):
-                if ai_response[i] == '{':
-                    brace_count += 1
-                elif ai_response[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_idx = i + 1
-                        break
-            
-            if end_idx == -1:
-                raise ValueError("Could not find matching closing brace for JSON")
-            
-            json_str = ai_response[start_idx:end_idx]
-            data = json.loads(json_str)
+            # First, try to extract JSON from markdown code blocks
+            import re
+            json_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
+            if json_block_match:
+                json_str = json_block_match.group(1)
+                data = json.loads(json_str)
+            else:
+                # Try to find JSON block with proper nesting handling
+                # Look for the first { and find its matching }
+                start_idx = ai_response.find('{')
+                if start_idx == -1:
+                    raise ValueError("No JSON found in AI response")
+                
+                # Count braces to find the matching closing brace
+                brace_count = 0
+                end_idx = -1
+                in_string = False
+                escape_next = False
+                
+                for i in range(start_idx, len(ai_response)):
+                    char = ai_response[i]
+                    
+                    # Handle string escaping
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if char == '\\':
+                        escape_next = True
+                        continue
+                    if char == '"':
+                        in_string = not in_string
+                        continue
+                    
+                    # Only count braces outside of strings
+                    if not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end_idx = i + 1
+                                break
+                
+                if end_idx == -1:
+                    raise ValueError("Could not find matching closing brace for JSON")
+                
+                json_str = ai_response[start_idx:end_idx]
+                data = json.loads(json_str)
             
             return ErrorContext(
                 category=ErrorCategory(data.get("category", "unknown")),
@@ -221,6 +246,8 @@ Respond in JSON format:
             )
         except Exception as e:
             print(f"Error parsing AI response: {e}")
+            print(f"AI response (first 500 chars): {ai_response[:500]}")
+            print(f"AI response (last 500 chars): {ai_response[-500:]}")
             return ErrorContext(
                 category=ErrorCategory.UNKNOWN,
                 error_message="Failed to parse AI response",
