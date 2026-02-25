@@ -174,6 +174,20 @@ class GitHubIntegration:
     def commit_and_push(self, repo_dir: str, message: str, files: List[str], branch: str) -> Tuple[bool, str, str]:
         """Commit changes and push to remote"""
         try:
+            # Configure git user identity
+            subprocess.run(
+                ["git", "config", "user.name", "AI Healing Agent"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "ai-agent@devops.local"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True
+            )
+            
             # Stage files
             for file in files:
                 subprocess.run(
