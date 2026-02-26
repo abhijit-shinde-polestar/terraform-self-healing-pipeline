@@ -80,43 +80,74 @@ class GitHubIntegration:
                 # Handle both absolute and relative file paths
                 file_rel_path = change["file"]
                 
+                # Normalize the path (resolve ../ and ./)
+                if file_rel_path.startswith('../'):
+                    # Remove leading ../ sequences - AI often provides paths relative to context dir
+                    normalized_path = file_rel_path
+                    while normalized_path.startswith('../'):
+                        normalized_path = normalized_path[3:]
+                    file_rel_path = normalized_path
+                
+                print(f"Looking for file: {file_rel_path}")
+                
                 # If the path doesn't start with repo_dir, it's a relative path
                 if not file_rel_path.startswith(repo_dir):
                     # First try the direct relative path from repo root
                     direct_path = os.path.join(repo_dir, file_rel_path)
                     if os.path.exists(direct_path):
                         file_path = direct_path
+                        print(f"Found file at direct path: {file_path}")
                     else:
-                        # Try to find the file by matching the relative path structure
+                        # Try to find the file by matching directory and filename pattern
                         file_path = None
+                        target_dir = os.path.dirname(file_rel_path)
+                        target_filename = os.path.basename(file_rel_path)
+                        
+                        print(f"Searching for {target_filename} in directory pattern: {target_dir}")
+                        
                         for root, dirs, files in os.walk(repo_dir):
-                            # Check if the relative path from repo_dir matches the requested path
-                            for file in files:
-                                full_path = os.path.join(root, file)
-                                rel_from_repo = os.path.relpath(full_path, repo_dir)
-                                if rel_from_repo == file_rel_path or rel_from_repo.endswith(file_rel_path):
-                                    # For replace actions, verify content matches
-                                    if change["action"] == "replace":
-                                        try:
-                                            with open(full_path, 'r') as f:
-                                                content = f.read()
-                                                if change["old_content"] in content:
-                                                    file_path = full_path
-                                                    break
-                                                else:
-                                                    print(f"File found but content doesn't match: {full_path}")
-                                                    print(f"Looking for: {change['old_content'][:100]}...")
-                                                    print(f"File contains: {content[:200]}...")
-                                        except Exception as e:
-                                            print(f"Error reading {full_path}: {e}")
-                                            continue
-                                    else:
+                            rel_dir = os.path.relpath(root, repo_dir)
+                            
+                            # Check if this directory matches the target directory
+                            if rel_dir == target_dir or rel_dir.endswith(target_dir):
+                                # Look for exact filename match first
+                                if target_filename in files:
+                                    full_path = os.path.join(root, target_filename)
+                                    file_path = full_path
+                                    print(f"Found exact match: {file_path}")
+                                    break
+                                
+                                # If not found, try similar filenames (e.g., vars.tf for variables.tf)
+                                for file in files:
+                                    if file.endswith('.tf') and target_filename.endswith('.tf'):
+                                        # Check for common variations
+                                        if (file == 'vars.tf' and target_filename == 'variables.tf') or \
+                                           (file == 'variables.tf' and target_filename == 'vars.tf'):
+                                            full_path = os.path.join(root, file)
+                                            file_path = full_path
+                                            print(f"Found similar file: {file_path} (looking for {target_filename})")
+                                            break
+                                
+                                if file_path:
+                                    break
+                        
+                        # If still not found, try broader search
+                        if not file_path:
+                            print(f"Broader search for any file matching: {target_filename}")
+                            for root, dirs, files in os.walk(repo_dir):
+                                for file in files:
+                                    full_path = os.path.join(root, file)
+                                    rel_from_repo = os.path.relpath(full_path, repo_dir)
+                                    if rel_from_repo == file_rel_path or rel_from_repo.endswith(file_rel_path):
                                         file_path = full_path
+                                        print(f"Found via broader search: {file_path}")
                                         break
-                            if file_path:
-                                break
+                                if file_path:
+                                    break
                     
                     if not file_path:
+                        print(f"❌ Could not find file: {file_rel_path} in {repo_dir}")
+                        print(f"Searched for: {target_filename} in directory: {target_dir}")
                         return False, f"Could not find file: {file_rel_path} in {repo_dir}", modified_files
                 else:
                     file_path = file_rel_path
