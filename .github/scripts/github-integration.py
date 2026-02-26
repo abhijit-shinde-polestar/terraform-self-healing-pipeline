@@ -82,22 +82,38 @@ class GitHubIntegration:
                 
                 # If the path doesn't start with repo_dir, it's a relative path
                 if not file_rel_path.startswith(repo_dir):
-                    # Try to find the file in the repo
-                    file_path = None
-                    for root, dirs, files in os.walk(repo_dir):
-                        if os.path.basename(file_rel_path) in files:
-                            potential_path = os.path.join(root, os.path.basename(file_rel_path))
-                            # Verify this is the right file by checking if it contains the old content
-                            if change["action"] == "replace":
-                                try:
-                                    with open(potential_path, 'r') as f:
-                                        if change["old_content"] in f.read():
-                                            file_path = potential_path
-                                            break
-                                except:
-                                    continue
-                            else:
-                                file_path = potential_path
+                    # First try the direct relative path from repo root
+                    direct_path = os.path.join(repo_dir, file_rel_path)
+                    if os.path.exists(direct_path):
+                        file_path = direct_path
+                    else:
+                        # Try to find the file by matching the relative path structure
+                        file_path = None
+                        for root, dirs, files in os.walk(repo_dir):
+                            # Check if the relative path from repo_dir matches the requested path
+                            for file in files:
+                                full_path = os.path.join(root, file)
+                                rel_from_repo = os.path.relpath(full_path, repo_dir)
+                                if rel_from_repo == file_rel_path or rel_from_repo.endswith(file_rel_path):
+                                    # For replace actions, verify content matches
+                                    if change["action"] == "replace":
+                                        try:
+                                            with open(full_path, 'r') as f:
+                                                content = f.read()
+                                                if change["old_content"] in content:
+                                                    file_path = full_path
+                                                    break
+                                                else:
+                                                    print(f"File found but content doesn't match: {full_path}")
+                                                    print(f"Looking for: {change['old_content'][:100]}...")
+                                                    print(f"File contains: {content[:200]}...")
+                                        except Exception as e:
+                                            print(f"Error reading {full_path}: {e}")
+                                            continue
+                                    else:
+                                        file_path = full_path
+                                        break
+                            if file_path:
                                 break
                     
                     if not file_path:
