@@ -1,363 +1,113 @@
-name: Self-Healing Agent
+name: Self-Healing Deployment Agent
 
 on:
   repository_dispatch:
     types: [heal-deployment]
-  
   workflow_dispatch:
     inputs:
       source_repo:
-        description: 'Source repository (owner/repo)'
+        description: 'Source repository (e.g., org/repo)'
         required: true
         type: string
       source_ref:
-        description: 'Source branch/ref'
+        description: 'Source branch reference'
         required: true
         type: string
       error_log_artifact:
-        description: 'Name of artifact containing error log'
+        description: 'Error log artifact name'
         required: true
         type: string
       terragrunt_path:
-        description: 'Path to Terragrunt configuration'
+        description: 'Path to terragrunt configuration'
         required: true
         type: string
       environment:
-        description: 'Environment'
+        description: 'Environment (dev/test/prod)'
+        required: true
+        type: string
+      workflow_to_trigger:
+        description: 'Workflow filename to trigger'
+        required: false
+        type: string
+        default: 'terragrunt-deployment.yaml'
+      max_attempts:
+        description: 'Maximum healing attempts'
+        required: false
+        type: number
+        default: 10
+      min_confidence:
+        description: 'Minimum AI confidence threshold'
+        required: false
+        type: number
+        default: 0.7
+      run_id:
+        description: 'Original workflow run ID'
         required: true
         type: string
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
-
 jobs:
-  heal:
-    name: Analyze and Fix
+  heal-deployment:
     runs-on: ubuntu-latest
-    outputs:
-      success: ${{ steps.final-status.outputs.success }}
-      branch_name: ${{ steps.final-status.outputs.branch_name }}
-      pr_number: ${{ steps.final-status.outputs.pr_number }}
-      attempts: ${{ steps.final-status.outputs.attempts }}
+    timeout-minutes: 600
     
+    outputs:
+      healing_successful: ${{ steps.healing_loop.outputs.healing_successful }}
+      fix_branch_created: ${{ steps.healing_loop.outputs.fix_branch_created }}
+      final_confidence: ${{ steps.healing_loop.outputs.final_confidence }}
+      attempts_made: ${{ steps.healing_loop.outputs.attempts_made }}
+
     steps:
-      - name: Checkout Self-Healing Pipeline Repo
+      - name: Checkout Self-Healing Pipeline
         uses: actions/checkout@v4
-        with:
-          path: healing-pipeline
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
-          pip install anthropic requests pyyaml
+          pip install -r .github/scripts/requirements.txt
 
-      - name: Download Error Log from Source Repo
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          SOURCE_REPO: ${{ github.event.client_payload.source_repo || inputs.source_repo }}
-          RUN_ID: ${{ github.event.client_payload.run_id || github.run_id }}
-          ARTIFACT_NAME: ${{ github.event.client_payload.artifact_name || inputs.error_log_artifact }}
+      - name: Extract Input Variables
+        id: extract_inputs
         run: |
-          # Download artifact from source repo using GitHub API
-          mkdir -p error-logs
-          
-          # Get artifact download URL
-          ARTIFACT_URL=$(curl -s \
-            -H "Authorization: token ${GH_PAT}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${SOURCE_REPO}/actions/runs/${RUN_ID}/artifacts" \
-            | jq -r ".artifacts[] | select(.name==\"${ARTIFACT_NAME}\") | .archive_download_url")
-          
-          if [ -z "$ARTIFACT_URL" ] || [ "$ARTIFACT_URL" = "null" ]; then
-            echo "❌ Could not find artifact ${ARTIFACT_NAME}"
-            exit 1
-          fi
-          
-          # Download and extract artifact
-          curl -L \
-            -H "Authorization: token ${GH_PAT}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "${ARTIFACT_URL}" \
-            -o artifact.zip
-          
-          unzip -q artifact.zip -d error-logs
-          echo "✅ Downloaded error log artifact"
-
-      - name: Clone Source Repository
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          SOURCE_REPO: ${{ github.event.client_payload.source_repo || inputs.source_repo }}
-          SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
-        run: |
-          # Extract branch name from ref
-          # Handle both refs/heads/branch and refs/pull/N/merge formats
-          if [[ "$SOURCE_REF" == refs/pull/* ]]; then
-            # For PR refs, extract the PR number and fetch the head branch
-            PR_NUM=$(echo "$SOURCE_REF" | sed 's|refs/pull/\([0-9]*\)/.*|\1|')
-            
-            # Clone the repo first
-            git clone --depth 1 https://${GH_PAT}@github.com/${SOURCE_REPO}.git source-repo
-            cd source-repo
-            
-            # Fetch the PR
-            git fetch origin pull/${PR_NUM}/head:pr-${PR_NUM}
-            git checkout pr-${PR_NUM}
+          if [ '${{ github.event_name }}' = 'repository_dispatch' ]; then
+            echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+            echo "source_ref=${{ github.event.client_payload.source_ref }}" >> $GITHUB_OUTPUT
+            echo "error_log_artifact=${{ github.event.client_payload.error_log_artifact }}" >> $GITHUB_OUTPUT
+            echo "terragrunt_path=${{ github.event.client_payload.terragrunt_path }}" >> $GITHUB_OUTPUT
+            echo "environment=${{ github.event.client_payload.environment }}" >> $GITHUB_OUTPUT
+            echo "workflow_to_trigger=${{ github.event.client_payload.workflow_to_trigger || 'terragrunt-deployment.yaml' }}" >> $GITHUB_OUTPUT
+            echo "max_attempts=${{ github.event.client_payload.max_attempts || 10 }}" >> $GITHUB_OUTPUT
+            echo "min_confidence=${{ github.event.client_payload.min_confidence || 0.7 }}" >> $GITHUB_OUTPUT
+            echo "run_id=${{ github.event.client_payload.run_id }}" >> $GITHUB_OUTPUT
           else
-            # Normal branch ref
-            BRANCH_NAME=$(echo "$SOURCE_REF" | sed 's|refs/heads/||')
-            git clone --depth 1 --branch "$BRANCH_NAME" \
-              https://${GH_PAT}@github.com/${SOURCE_REPO}.git \
-              source-repo
+            echo "source_repo=${{ github.event.inputs.source_repo }}" >> $GITHUB_OUTPUT
+            echo "source_ref=${{ github.event.inputs.source_ref }}" >> $GITHUB_OUTPUT
+            echo "error_log_artifact=${{ github.event.inputs.error_log_artifact }}" >> $GITHUB_OUTPUT
+            echo "terragrunt_path=${{ github.event.inputs.terragrunt_path }}" >> $GITHUB_OUTPUT
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "workflow_to_trigger=${{ github.event.inputs.workflow_to_trigger }}" >> $GITHUB_OUTPUT
+            echo "max_attempts=${{ github.event.inputs.max_attempts }}" >> $GITHUB_OUTPUT
+            echo "min_confidence=${{ github.event.inputs.min_confidence }}" >> $GITHUB_OUTPUT
+            echo "run_id=${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run Self-Healing Loop
-        id: healing
+      - name: Self-Healing Loop
+        id: healing_loop
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          SOURCE_REPO: ${{ github.event.client_payload.source_repo || inputs.source_repo }}
-          SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref }}
-          TERRAGRUNT_PATH: ${{ github.event.client_payload.workload_path || inputs.terragrunt_path }}
-          ENVIRONMENT: ${{ github.event.client_payload.environment || inputs.environment }}
-          WORKFLOW_TO_TRIGGER: ${{ github.event.client_payload.workflow_name || inputs.workflow_to_trigger || 'terragrunt-deployment.yaml' }}
-          MAX_ATTEMPTS: ${{ github.event.client_payload.max_attempts || inputs.max_attempts || 5 }}
-          MIN_CONFIDENCE: ${{ github.event.client_payload.min_confidence || inputs.min_confidence || 0.7 }}
+          SOURCE_REPO: ${{ steps.extract_inputs.outputs.source_repo }}
+          SOURCE_REF: ${{ steps.extract_inputs.outputs.source_ref }}
+          ERROR_LOG_ARTIFACT: ${{ steps.extract_inputs.outputs.error_log_artifact }}
+          TERRAGRUNT_PATH: ${{ steps.extract_inputs.outputs.terragrunt_path }}
+          ENVIRONMENT: ${{ steps.extract_inputs.outputs.environment }}
+          WORKFLOW_TO_TRIGGER: ${{ steps.extract_inputs.outputs.workflow_to_trigger }}
+          MAX_ATTEMPTS: ${{ steps.extract_inputs.outputs.max_attempts }}
+          MIN_CONFIDENCE: ${{ steps.extract_inputs.outputs.min_confidence }}
+          RUN_ID: ${{ steps.extract_inputs.outputs.run_id }}
         run: |
-          cd healing-pipeline
-          
-          ATTEMPT=0
-          MAX_ATTEMPTS=${MAX_ATTEMPTS:-5}
-          SUCCESS=false
-          PR_NUMBER=""
-          
-          # Extract branch name from ref (handle both refs/heads/branch and refs/pull/N/merge)
-          if [[ "$SOURCE_REF" == refs/pull/* ]]; then
-            # For PR refs, use the PR branch name
-            BRANCH_NAME=$(cd ../source-repo && git rev-parse --abbrev-ref HEAD)
-          else
-            # Normal branch ref
-            BRANCH_NAME=$(echo "$SOURCE_REF" | sed 's|refs/heads/||')
-          fi
-          
-          echo "🔧 Will commit fixes to branch: $BRANCH_NAME"
-          
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            echo "=========================================="
-            echo "🤖 Healing Attempt: $ATTEMPT/$MAX_ATTEMPTS"
-            echo "=========================================="
-            
-            # Analyze error with AI
-            echo "🔍 Analyzing error with AI..."
-            
-            # Find the error log file
-            ERROR_LOG_FILE=$(find ../error-logs -name "*.log" -type f | head -n 1)
-            if [ -z "$ERROR_LOG_FILE" ]; then
-              echo "❌ No error log file found"
-              exit 1
-            fi
-            
-            echo "Using error log: $ERROR_LOG_FILE"
-            
-            # Get the directory containing the terragrunt config
-            CONTEXT_DIR=$(dirname "../source-repo/${TERRAGRUNT_PATH}")
-            
-            python .github/scripts/ai-healing-agent.py \
-              --error-log "$ERROR_LOG_FILE" \
-              --context-dir "$CONTEXT_DIR" \
-              --output fix-result.json \
-              --min-confidence ${MIN_CONFIDENCE}
-            
-            AI_RESULT=$?
-            
-            if [ $AI_RESULT -ne 0 ]; then
-              echo "❌ AI analysis failed or confidence too low"
-              cat fix-result.json
-              break
-            fi
-            
-            echo "✅ AI generated fix"
-            cat fix-result.json
-            
-            # Apply fixes using GitHub integration
-            echo "🔧 Applying fixes to source repository on branch: ${BRANCH_NAME}..."
-            python .github/scripts/github-integration.py \
-              --token ${GH_PAT} \
-              --repo ${SOURCE_REPO} \
-              --action apply-fix \
-              --fix-file fix-result.json \
-              --source-dir ../source-repo \
-              --branch-name ${BRANCH_NAME} \
-              --commit-message "🤖 Auto-fix: Deployment error (attempt ${ATTEMPT})" \
-              --output apply-result.json
-            
-            APPLY_RESULT=$?
-            
-            if [ $APPLY_RESULT -ne 0 ]; then
-              echo "❌ Failed to apply fixes"
-              cat apply-result.json
-              break
-            fi
-            
-            echo "✅ Fixes applied and pushed to branch: $BRANCH_NAME"
-            
-            # Push triggers the workflow automatically (no need to manually trigger)
-            echo "✅ Fix pushed to ${BRANCH_NAME} - workflow will auto-trigger"
-            
-            # Wait for workflow to start
-            echo "⏳ Waiting for deployment workflow to start..."
-            sleep 45  # Give workflow time to start (increased for job-based workflows)
-            
-            # Poll for workflow completion (max 15 minutes for job-based workflows)
-            POLL_COUNT=0
-            MAX_POLLS=30  # 30 * 30s = 15 minutes
-            WORKFLOW_COMPLETED=false
-            WORKFLOW_FOUND=false
-            
-            while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-              python .github/scripts/github-integration.py \
-                --token ${GH_PAT} \
-                --repo ${SOURCE_REPO} \
-                --action check-latest-workflow \
-                --branch ${BRANCH_NAME} \
-                --output workflow-status.json
-              
-              CHECK_RESULT=$?
-              
-              if [ $CHECK_RESULT -eq 0 ]; then
-                WORKFLOW_FOUND=true
-                WORKFLOW_STATUS=$(jq -r '.status' workflow-status.json)
-                WORKFLOW_CONCLUSION=$(jq -r '.conclusion' workflow-status.json)
-                RUN_URL=$(jq -r '.html_url' workflow-status.json)
-                
-                echo "Poll $((POLL_COUNT + 1))/$MAX_POLLS: Status=$WORKFLOW_STATUS, Conclusion=$WORKFLOW_CONCLUSION"
-                echo "Run URL: $RUN_URL"
-                
-                if [ "$WORKFLOW_STATUS" = "completed" ]; then
-                  WORKFLOW_COMPLETED=true
-                  break
-                fi
-              else
-                echo "Poll $((POLL_COUNT + 1))/$MAX_POLLS: Waiting for workflow to start..."
-              fi
-              
-              sleep 30
-              POLL_COUNT=$((POLL_COUNT + 1))
-            done
-            
-            if [ "$WORKFLOW_FOUND" = "false" ]; then
-              echo "⚠️  No workflow run detected - may not have triggered"
-              continue  # Try next attempt
-            fi
-            
-            if [ "$WORKFLOW_COMPLETED" = "false" ]; then
-              echo "⏱️  Workflow timeout - deployment did not complete in 15 minutes"
-              echo "This may indicate the workflow is stuck or taking too long"
-              continue  # Try next attempt
-            fi
-            
-            # Check if deployment was successful
-            if [ "$WORKFLOW_CONCLUSION" = "success" ]; then
-              echo "🎉 Deployment successful!"
-              echo "✅ Fix applied to branch ${BRANCH_NAME} and deployment verified"
-              echo "All jobs (plan + apply) completed successfully"
-              SUCCESS=true
-              break
-            else
-              echo "⚠️  Deployment failed with conclusion: $WORKFLOW_CONCLUSION"
-              echo "One or more jobs (plan/apply) failed"
-              echo "Will analyze new errors and retry with next attempt..."
-              
-              # Download new error logs for next iteration
-              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-                echo "📥 Downloading new error logs for retry..."
-                # Get the failed run ID
-                FAILED_RUN_ID=$(jq -r '.run_id' workflow-status.json)
-                
-                # Wait a bit for artifacts to be uploaded
-                sleep 10
-                
-                # Download new artifact (could be from plan or apply job)
-                ARTIFACT_URL=$(curl -s \
-                  -H "Authorization: token ${GH_PAT}" \
-                  -H "Accept: application/vnd.github.v3+json" \
-                  "https://api.github.com/repos/${SOURCE_REPO}/actions/runs/${FAILED_RUN_ID}/artifacts" \
-                  | jq -r ".artifacts[] | select(.name | contains(\"error-logs\")) | .archive_download_url" | head -n 1)
-                
-                if [ -n "$ARTIFACT_URL" ] && [ "$ARTIFACT_URL" != "null" ]; then
-                  rm -rf ../error-logs/*
-                  curl -L \
-                    -H "Authorization: token ${GH_PAT}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "${ARTIFACT_URL}" \
-                    -o ../error-logs/artifact.zip
-                  unzip -q -o ../error-logs/artifact.zip -d ../error-logs
-                  echo "✅ Downloaded new error logs from failed job"
-                else
-                  echo "⚠️  Could not download new error logs"
-                  echo "Checking if artifacts are still being uploaded..."
-                  sleep 15
-                  # Try one more time
-                  ARTIFACT_URL=$(curl -s \
-                    -H "Authorization: token ${GH_PAT}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/${SOURCE_REPO}/actions/runs/${FAILED_RUN_ID}/artifacts" \
-                    | jq -r ".artifacts[] | select(.name | contains(\"error-logs\")) | .archive_download_url" | head -n 1)
-                  
-                  if [ -n "$ARTIFACT_URL" ] && [ "$ARTIFACT_URL" != "null" ]; then
-                    rm -rf ../error-logs/*
-                    curl -L \
-                      -H "Authorization: token ${GH_PAT}" \
-                      -H "Accept: application/vnd.github.v3+json" \
-                      "${ARTIFACT_URL}" \
-                      -o ../error-logs/artifact.zip
-                    unzip -q -o ../error-logs/artifact.zip -d ../error-logs
-                    echo "✅ Downloaded new error logs (retry)"
-                  else
-                    echo "❌ Failed to download new error logs, will retry with previous analysis"
-                  fi
-                fi
-              fi
-            fi
-          done
-          
-          # Set outputs
-          echo "success=${SUCCESS}" >> $GITHUB_OUTPUT
-          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
-          echo "pr_number=${PR_NUMBER}" >> $GITHUB_OUTPUT
-          echo "attempts=${ATTEMPT}" >> $GITHUB_OUTPUT
-          
-          if [ "$SUCCESS" = "true" ]; then
-            echo "✅ Self-healing completed successfully after ${ATTEMPT} attempt(s)"
-            exit 0
-          else
-            echo "❌ Self-healing failed after ${ATTEMPT} attempt(s)"
-            exit 1
-          fi
-
-      - name: Set Final Status
-        id: final-status
-        if: always()
-        run: |
-          echo "success=${{ steps.healing.outputs.success }}" >> $GITHUB_OUTPUT
-          echo "branch_name=${{ steps.healing.outputs.branch_name }}" >> $GITHUB_OUTPUT
-          echo "pr_number=${{ steps.healing.outputs.pr_number }}" >> $GITHUB_OUTPUT
-          echo "attempts=${{ steps.healing.outputs.attempts }}" >> $GITHUB_OUTPUT
-
-      - name: Upload Healing Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: healing-results-${{ github.run_number }}
-          path: |
-            healing-pipeline/fix-result.json
-            healing-pipeline/apply-result.json
-            healing-pipeline/workflow-status.json
-            healing-pipeline/pr-result.json
-          retention-days: 30
+          python .github/scripts/github-integration.py
