@@ -1,357 +1,382 @@
 #!/usr/bin/env python3
 """
-Autonomous Self-Healing AI Agent for Terraform/Terragrunt Deployments
-Cross-repository version - analyzes errors and creates fixes in source repos
+AI-Powered Terraform/Terragrunt Healing Agent
+
+This script uses Claude AI (Anthropic) to automatically analyze and fix 
+Terraform/Terragrunt deployment errors. It integrates with GitHub Actions
+to provide autonomous error resolution in CI/CD pipelines.
+
+The agent analyzes error logs, examines the codebase context, and generates
+structured fixes that can be automatically applied to resolve deployment issues.
 """
 
 import os
 import sys
 import json
 import re
-import subprocess
-import time
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
-from enum import Enum
-import anthropic
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, asdict
+from datetime import datetime
 
+try:
+    import anthropic
+except ImportError:
+    print("❌ Error: anthropic package not installed")
+    print("Install with: pip install anthropic")
+    sys.exit(1)
 
-class ErrorCategory(Enum):
-    """Classification of infrastructure errors"""
-    PROVIDER_VERSION = "provider_version"
-    RESOURCE_CONFLICT = "resource_conflict"
-    MISSING_RESOURCE = "missing_resource"
-    PERMISSION_DENIED = "permission_denied"
-    SYNTAX_ERROR = "syntax_error"
-    STATE_LOCK = "state_lock"
-    DEPENDENCY_ERROR = "dependency_error"
-    TIMEOUT = "timeout"
-    UNKNOWN = "unknown"
-
-
-@dataclass
-class ErrorContext:
-    """Context information about a deployment error"""
-    category: ErrorCategory
-    error_message: str
-    affected_files: List[str]
-    suggested_fix: str
-    confidence: float
-    raw_output: str
-
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('ai-healing-agent.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 @dataclass
-class FixResult:
-    """Result of applying a fix"""
+class FixAction:
+    """Represents a single file modification action."""
+    path: str
+    action: str  # 'update', 'create', 'delete'
+    content: Optional[str] = None
+    reason: str = ""
+
+@dataclass
+class HealingResult:
+    """Result of the healing analysis."""
     success: bool
-    message: str
-    files_modified: List[str]
-    branch_name: str
-    commit_sha: str
+    confidence: float
+    error_category: str
+    fix_summary: str
+    actions: List[FixAction]
+    reasoning: str
+    warnings: List[str]
+    estimated_time: str
 
-
-class SafetyRails:
-    """Safety mechanisms to prevent dangerous automated changes"""
+class TerraformHealingAgent:
+    """AI agent for analyzing and fixing Terraform/Terragrunt errors."""
     
-    MAX_RETRY_ATTEMPTS = 5
-    MAX_FILES_PER_FIX = 10
-    PROTECTED_PATTERNS = [
-        r".*\.tfstate$",
-        r".*\.tfstate\.backup$",
-        r".*\.terraform\.lock\.hcl$",
-    ]
-    DANGEROUS_OPERATIONS = [
-        "destroy",
-        "delete",
-        "remove",
-        "drop",
-    ]
-    
-    @staticmethod
-    def validate_file_changes(files: List[str]) -> Tuple[bool, str]:
-        """Validate that file changes are safe"""
-        if len(files) > SafetyRails.MAX_FILES_PER_FIX:
-            return False, f"Too many files to modify ({len(files)} > {SafetyRails.MAX_FILES_PER_FIX})"
-        
-        for file_path in files:
-            for pattern in SafetyRails.PROTECTED_PATTERNS:
-                if re.match(pattern, file_path):
-                    return False, f"Attempting to modify protected file: {file_path}"
-        
-        return True, "Validation passed"
-    
-    @staticmethod
-    def validate_fix_content(content: str) -> Tuple[bool, str]:
-        """Validate that fix content doesn't contain dangerous operations"""
-        content_lower = content.lower()
-        
-        for operation in SafetyRails.DANGEROUS_OPERATIONS:
-            if operation in content_lower and "resource" in content_lower:
-                return False, f"Fix contains potentially dangerous operation: {operation}"
-        
-        return True, "Content validation passed"
-
-
-class TerraformErrorAnalyzer:
-    """Analyzes Terraform/Terragrunt errors using AI"""
-    
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "claude-3-sonnet-20240229"):
+        """Initialize the healing agent."""
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-sonnet-4-20250514"  # Claude Sonnet 4.5
+        self.model = model
+        self.max_tokens = 4000
+        
+    def analyze_and_fix(self, 
+                       error_logs: str, 
+                       repo_path: str, 
+                       terragrunt_path: str,
+                       environment: str) -> HealingResult:
+        """Analyze error logs and generate fixes."""
+        logger.info(f"🔍 Starting analysis for {terragrunt_path} in {environment}")
+        
+        try:
+            # Gather context
+            context = self._gather_context(repo_path, terragrunt_path)
+            
+            # Create prompt
+            prompt = self._create_analysis_prompt(error_logs, context, environment)
+            
+            # Query AI
+            response = self._query_claude(prompt)
+            
+            # Parse response
+            result = self._parse_ai_response(response)
+            
+            logger.info(f"✅ Analysis complete. Confidence: {result.confidence:.2f}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Analysis failed: {str(e)}")
+            return HealingResult(
+                success=False,
+                confidence=0.0,
+                error_category="analysis_error",
+                fix_summary=f"Failed to analyze error: {str(e)}",
+                actions=[],
+                reasoning="Internal analysis error occurred",
+                warnings=[f"Analysis error: {str(e)}"],
+                estimated_time="0 minutes"
+            )
     
-    def analyze_error(self, error_output: str, context_files: Dict[str, str]) -> ErrorContext:
-        """Analyze error output and generate fix using Claude"""
+    def _gather_context(self, repo_path: str, terragrunt_path: str) -> Dict[str, Any]:
+        """Gather context from the repository."""
+        logger.info("📂 Gathering repository context...")
         
-        context = self._build_context(error_output, context_files)
+        context = {
+            "files": {},
+            "structure": [],
+            "terragrunt_config": None,
+            "terraform_files": [],
+            "dependencies": []
+        }
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            temperature=0,
-            system=self._get_system_prompt(),
-            messages=[
-                {
-                    "role": "user",
-                    "content": context
-                }
+        try:
+            base_path = Path(repo_path) / terragrunt_path
+            if not base_path.exists():
+                logger.warning(f"⚠️  Path not found: {base_path}")
+                return context
+            
+            # Read key files
+            key_files = [
+                "terragrunt.hcl",
+                "main.tf", 
+                "variables.tf",
+                "outputs.tf",
+                "versions.tf",
+                "providers.tf"
             ]
-        )
+            
+            for file_name in key_files:
+                file_path = base_path / file_name
+                if file_path.exists():
+                    try:
+                        content = file_path.read_text(encoding='utf-8')
+                        context["files"][file_name] = content
+                        logger.info(f"📄 Read {file_name} ({len(content)} chars)")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Could not read {file_name}: {e}")
+            
+            # Get directory structure
+            try:
+                for item in base_path.rglob('*'):
+                    if item.is_file() and item.suffix in ['.tf', '.hcl', '.yaml', '.yml']:
+                        rel_path = item.relative_to(base_path)
+                        context["structure"].append(str(rel_path))
+            except Exception as e:
+                logger.warning(f"⚠️  Could not scan directory: {e}")
+            
+            logger.info(f"📊 Context gathered: {len(context['files'])} files, {len(context['structure'])} items")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to gather context: {e}")
         
-        return self._parse_ai_response(response.content[0].text, error_output)
-    
-    def _get_system_prompt(self) -> str:
-        """Get the system prompt for the AI agent"""
-        return """You are an expert DevOps engineer specializing in Terraform and Terragrunt infrastructure automation.
-Your task is to analyze deployment errors and provide precise, actionable fixes.
-
-When analyzing errors, you must:
-1. Classify the error into one of these categories: provider_version, resource_conflict, missing_resource, permission_denied, syntax_error, state_lock, dependency_error, timeout, unknown
-2. Identify the root cause
-3. Provide a specific fix with exact file paths and code changes
-4. Assign a confidence score (0.0 to 1.0)
-
-CRITICAL SAFETY RULES:
-- Never suggest destroying or deleting production resources
-- Never modify .tfstate files directly
-- Never suggest removing state locks manually unless absolutely necessary
-- Always prefer minimal, targeted fixes
-- Validate all changes are backwards compatible
-
-Respond in JSON format:
-{
-  "category": "error_category",
-  "confidence": 0.95,
-  "root_cause": "Brief explanation",
-  "affected_files": ["path/to/file1.tf", "path/to/file2.hcl"],
-  "fix": {
-    "description": "What this fix does",
-    "changes": [
-      {
-        "file": "path/to/file.tf",
-        "action": "replace|add|remove",
-        "old_content": "content to replace (if action is replace)",
-        "new_content": "new content to add"
-      }
-    ]
-  }
-}"""
-    
-    def _build_context(self, error_output: str, context_files: Dict[str, str]) -> str:
-        """Build context for AI analysis"""
-        context = f"""# Terraform/Terragrunt Deployment Error
-
-## Error Output:
-```
-{error_output}
-```
-
-## Relevant Files:
-"""
-        for file_path, content in context_files.items():
-            context += f"\n### {file_path}\n```hcl\n{content}\n```\n"
-        
-        context += "\n\nAnalyze this error and provide a fix in JSON format."
         return context
     
-    def _parse_ai_response(self, ai_response: str, raw_output: str) -> ErrorContext:
-        """Parse AI response into ErrorContext"""
-        try:
-            # First, try to extract JSON from markdown code blocks
-            import re
-            json_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
-            if json_block_match:
-                json_str = json_block_match.group(1)
-                data = json.loads(json_str)
-            else:
-                # Try to find JSON block with proper nesting handling
-                # Look for the first { and find its matching }
-                start_idx = ai_response.find('{')
-                if start_idx == -1:
-                    raise ValueError("No JSON found in AI response")
-                
-                # Count braces to find the matching closing brace
-                brace_count = 0
-                end_idx = -1
-                in_string = False
-                escape_next = False
-                
-                for i in range(start_idx, len(ai_response)):
-                    char = ai_response[i]
-                    
-                    # Handle string escaping
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if char == '\\':
-                        escape_next = True
-                        continue
-                    if char == '"':
-                        in_string = not in_string
-                        continue
-                    
-                    # Only count braces outside of strings
-                    if not in_string:
-                        if char == '{':
-                            brace_count += 1
-                        elif char == '}':
-                            brace_count -= 1
-                            if brace_count == 0:
-                                end_idx = i + 1
-                                break
-                
-                if end_idx == -1:
-                    raise ValueError("Could not find matching closing brace for JSON")
-                
-                json_str = ai_response[start_idx:end_idx]
-                data = json.loads(json_str)
-            
-            return ErrorContext(
-                category=ErrorCategory(data.get("category", "unknown")),
-                error_message=data.get("root_cause", "Unknown error"),
-                affected_files=data.get("affected_files", []),
-                suggested_fix=json.dumps(data.get("fix", {}), indent=2),
-                confidence=float(data.get("confidence", 0.5)),
-                raw_output=raw_output
-            )
-        except json.JSONDecodeError as e:
-            print(f"Error parsing AI response JSON: {e}")
-            print(f"Attempted to parse: {json_str[:200] if 'json_str' in locals() else 'N/A'}...")
-            return ErrorContext(
-                category=ErrorCategory.UNKNOWN,
-                error_message="Failed to parse AI response - invalid JSON",
-                affected_files=[],
-                suggested_fix="",
-                confidence=0.0,
-                raw_output=raw_output
-            )
-        except Exception as e:
-            print(f"Error parsing AI response: {e}")
-            print(f"AI response (first 500 chars): {ai_response[:500]}")
-            print(f"AI response (last 500 chars): {ai_response[-500:]}")
-            return ErrorContext(
-                category=ErrorCategory.UNKNOWN,
-                error_message="Failed to parse AI response",
-                affected_files=[],
-                suggested_fix="",
-                confidence=0.0,
-                raw_output=raw_output
-            )
+    def _create_analysis_prompt(self, error_logs: str, context: Dict, environment: str) -> str:
+        """Create the analysis prompt for Claude."""
+        return f'''You are an expert Terraform/Terragrunt DevOps engineer. Analyze the deployment error and provide a fix.
 
+ERROR LOGS:
+
+{error_logs[:3000]}  # Truncate long logs
+
+
+CONTEXT:
+Environment: {environment}
+Files in repository:
+{json.dumps(context["files"], indent=2)[:2000]}
+
+Directory structure:
+{json.dumps(context["structure"], indent=2)[:1000]}
+
+ANALYSIS REQUIRED:
+1. Identify the root cause of the error
+2. Classify the error type
+3. Provide a confidence score (0.0-1.0)
+4. Generate specific file changes to fix the issue
+5. Explain the reasoning
+
+RESPONSE FORMAT (JSON only):
+{{
+  "success": true,
+  "confidence": 0.85,
+  "error_category": "provider_version_mismatch",
+  "fix_summary": "Update provider version constraints",
+  "actions": [
+    {{
+      "path": "versions.tf",
+      "action": "update",
+      "content": "terraform {{\n  required_providers {{\n    aws = {{\n      source = \"hashicorp/aws\"\n      version = \"~> 5.0\"\n    }}\n  }}\n}}",
+      "reason": "Fix version constraint"
+    }}
+  ],
+  "reasoning": "The error indicates...",
+  "warnings": [],
+  "estimated_time": "2-3 minutes"
+}}
+
+IMPORTANT:
+- Only return valid JSON
+- Keep file content concise
+- Never modify state files
+- Confidence must be realistic
+- Provide clear reasoning
+'''
+    
+    def _query_claude(self, prompt: str) -> str:
+        """Query Claude API."""
+        logger.info("🤖 Querying Claude API...")
+        
+        try:
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            )
+            
+            response_text = message.content[0].text
+            logger.info(f"✅ Received response ({len(response_text)} chars)")
+            return response_text
+            
+        except Exception as e:
+            logger.error(f"❌ Claude API error: {e}")
+            raise
+    
+    def _parse_ai_response(self, response: str) -> HealingResult:
+        """Parse AI response into structured result."""
+        logger.info("📝 Parsing AI response...")
+        
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON found in response")
+            
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
+            
+            # Convert to FixAction objects
+            actions = []
+            for action_data in data.get("actions", []):
+                action = FixAction(
+                    path=action_data["path"],
+                    action=action_data["action"],
+                    content=action_data.get("content"),
+                    reason=action_data.get("reason", "")
+                )
+                actions.append(action)
+            
+            result = HealingResult(
+                success=data.get("success", False),
+                confidence=float(data.get("confidence", 0.0)),
+                error_category=data.get("error_category", "unknown"),
+                fix_summary=data.get("fix_summary", ""),
+                actions=actions,
+                reasoning=data.get("reasoning", ""),
+                warnings=data.get("warnings", []),
+                estimated_time=data.get("estimated_time", "Unknown")
+            )
+            
+            # Validate result
+            self._validate_result(result)
+            
+            logger.info(f"✅ Parsed result: {len(result.actions)} actions, confidence: {result.confidence}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to parse response: {e}")
+            logger.debug(f"Raw response: {response[:500]}...")
+            
+            return HealingResult(
+                success=False,
+                confidence=0.0,
+                error_category="parse_error",
+                fix_summary=f"Failed to parse AI response: {str(e)}",
+                actions=[],
+                reasoning="Could not parse AI response",
+                warnings=[f"Parse error: {str(e)}"],
+                estimated_time="0 minutes"
+            )
+    
+    def _validate_result(self, result: HealingResult) -> None:
+        """Validate the healing result."""
+        if result.confidence < 0.0 or result.confidence > 1.0:
+            raise ValueError(f"Invalid confidence score: {result.confidence}")
+        
+        for action in result.actions:
+            if action.action not in ["update", "create", "delete"]:
+                raise ValueError(f"Invalid action: {action.action}")
+            
+            if action.path.endswith(".tfstate") or ".terraform/" in action.path:
+                raise ValueError(f"Cannot modify protected file: {action.path}")
+    
+    def export_result(self, result: HealingResult, output_file: str) -> None:
+        """Export result to JSON file for GitHub Actions."""
+        logger.info(f"💾 Exporting result to {output_file}")
+        
+        try:
+            output_data = asdict(result)
+            
+            with open(output_file, 'w') as f:
+                json.dump(output_data, f, indent=2)
+            
+            logger.info(f"✅ Result exported successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to export result: {e}")
+            raise
 
 def main():
-    """Main entry point"""
-    import argparse
+    """Main entry point."""
+    logger.info("🚀 Starting AI Healing Agent")
     
-    parser = argparse.ArgumentParser(description="AI-powered self-healing deployment agent")
-    parser.add_argument("--error-log", required=True, help="Path to error log file")
-    parser.add_argument("--context-dir", required=True, help="Directory with context files")
-    parser.add_argument("--api-key", help="Anthropic API key (or set ANTHROPIC_API_KEY env var)")
-    parser.add_argument("--output", default="fix-result.json", help="Output file for fix result")
-    parser.add_argument("--min-confidence", type=float, default=0.7, help="Minimum confidence threshold")
-    
-    args = parser.parse_args()
-    
-    # Get API key
-    api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY")
+    # Get environment variables
+    api_key = os.getenv('ANTHROPIC_API_KEY')
     if not api_key:
-        print("❌ Error: ANTHROPIC_API_KEY not set")
+        logger.error("❌ ANTHROPIC_API_KEY environment variable not set")
         sys.exit(1)
     
-    # Read error log
+    error_log_file = os.getenv('ERROR_LOG_FILE', 'error.log')
+    repo_path = os.getenv('REPO_PATH', '.')
+    terragrunt_path = os.getenv('TERRAGRUNT_PATH', '')
+    environment = os.getenv('ENVIRONMENT', 'dev')
+    output_file = os.getenv('OUTPUT_FILE', 'healing-result.json')
+    
+    logger.info(f"📋 Configuration:")
+    logger.info(f"  Error log: {error_log_file}")
+    logger.info(f"  Repo path: {repo_path}")
+    logger.info(f"  Terragrunt path: {terragrunt_path}")
+    logger.info(f"  Environment: {environment}")
+    logger.info(f"  Output file: {output_file}")
+    
     try:
-        with open(args.error_log, 'r') as f:
-            error_output = f.read()
-    except Exception as e:
-        print(f"❌ Error reading log file: {e}")
-        sys.exit(1)
-    
-    # Gather context files
-    context_files = {}
-    for root, dirs, files in os.walk(args.context_dir):
-        if '.terraform' in root or '.git' in root:
-            continue
+        # Read error logs
+        if not os.path.exists(error_log_file):
+            logger.error(f"❌ Error log file not found: {error_log_file}")
+            sys.exit(1)
         
-        for file in files:
-            if file.endswith(('.tf', '.hcl')):
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, args.context_dir)
-                
-                try:
-                    with open(file_path, 'r') as f:
-                        context_files[rel_path] = f.read()
-                except Exception as e:
-                    print(f"Warning: Could not read {rel_path}: {e}")
-    
-    print(f"📁 Gathered {len(context_files)} context files")
-    
-    # Analyze error
-    print("🔍 Analyzing error with AI...")
-    analyzer = TerraformErrorAnalyzer(api_key)
-    error_context = analyzer.analyze_error(error_output, context_files)
-    
-    print(f"📊 Category: {error_context.category.value}")
-    print(f"📊 Confidence: {error_context.confidence:.2%}")
-    print(f"📊 Root Cause: {error_context.error_message}")
-    
-    # Check confidence threshold
-    if error_context.confidence < args.min_confidence:
-        print(f"⚠️  Confidence too low ({error_context.confidence:.2%} < {args.min_confidence:.2%})")
-        result = {
-            "success": False,
-            "reason": "low_confidence",
-            "confidence": error_context.confidence,
-            "category": error_context.category.value,
-            "message": error_context.error_message
-        }
-    else:
-        # Validate safety
-        is_safe, msg = SafetyRails.validate_file_changes(error_context.affected_files)
-        if not is_safe:
-            print(f"⚠️  Safety validation failed: {msg}")
-            result = {
-                "success": False,
-                "reason": "safety_violation",
-                "message": msg
-            }
+        with open(error_log_file, 'r') as f:
+            error_logs = f.read()
+        
+        logger.info(f"📄 Read error logs ({len(error_logs)} chars)")
+        
+        # Create agent and analyze
+        agent = TerraformHealingAgent(api_key)
+        result = agent.analyze_and_fix(
+            error_logs=error_logs,
+            repo_path=repo_path,
+            terragrunt_path=terragrunt_path,
+            environment=environment
+        )
+        
+        # Export result
+        agent.export_result(result, output_file)
+        
+        # Print summary
+        if result.success and result.confidence >= 0.7:
+            logger.info(f"✅ SUCCESS: {result.fix_summary}")
+            logger.info(f"🎯 Confidence: {result.confidence:.2f}")
+            logger.info(f"📝 Actions: {len(result.actions)}")
+            sys.exit(0)
         else:
-            result = {
-                "success": True,
-                "category": error_context.category.value,
-                "confidence": error_context.confidence,
-                "message": error_context.error_message,
-                "affected_files": error_context.affected_files,
-                "fix": json.loads(error_context.suggested_fix)
-            }
-            print("✅ Fix generated successfully")
+            logger.warning(f"⚠️  LOW CONFIDENCE: {result.fix_summary}")
+            logger.warning(f"🎯 Confidence: {result.confidence:.2f}")
+            sys.exit(1)
     
-    # Write output
-    with open(args.output, 'w') as f:
-        json.dump(result, f, indent=2)
-    
-    print(f"📝 Results written to {args.output}")
-    
-    sys.exit(0 if result.get("success", False) else 1)
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+        sys.exit(1)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
