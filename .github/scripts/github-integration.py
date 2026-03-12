@@ -1,507 +1,388 @@
 #!/usr/bin/env python3
-"""
-GitHub Integration for Cross-Repository Self-Healing
-Handles branch creation, commits, and workflow triggering in source repos
-"""
-
 import os
 import sys
 import json
-import subprocess
+import time
 import requests
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
 
+class GitHubRateLimitError(Exception):
+    """Custom exception for rate limit errors"""
+    def __init__(self, message: str, reset_time: Optional[int] = None):
+        self.message = message
+        self.reset_time = reset_time
+        super().__init__(self.message)
 
 class GitHubIntegration:
-    """Handle GitHub operations across repositories"""
-    
-    def __init__(self, token: str, source_repo: str):
-        """
-        Initialize GitHub integration
-        
-        Args:
-            token: GitHub Personal Access Token
-            source_repo: Source repository in format 'owner/repo'
-        """
+    def __init__(self, token: str):
         self.token = token
-        self.source_repo = source_repo
-        self.api_base = "https://api.github.com"
-        self.headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-    
-    def clone_repo(self, target_dir: str, ref: str = "main") -> Tuple[bool, str]:
-        """Clone the source repository"""
-        try:
-            clone_url = f"https://{self.token}@github.com/{self.source_repo}.git"
-            
-            cmd = ["git", "clone", "--depth", "1", "--branch", ref, clone_url, target_dir]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            
-            return True, f"Cloned {self.source_repo} successfully"
-        except subprocess.CalledProcessError as e:
-            return False, f"Failed to clone: {e.stderr}"
-    
-    def create_branch(self, repo_dir: str, branch_name: str, base_ref: str = "main") -> Tuple[bool, str]:
-        """Create a new branch in the repository"""
-        try:
-            # Configure git
-            subprocess.run(
-                ["git", "config", "user.name", "AI Healing Agent"],
-                cwd=repo_dir,
-                check=True
-            )
-            subprocess.run(
-                ["git", "config", "user.email", "ai-agent@devops.local"],
-                cwd=repo_dir,
-                check=True
-            )
-            
-            # Create and checkout new branch
-            subprocess.run(
-                ["git", "checkout", "-b", branch_name],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True
-            )
-            
-            return True, f"Created branch {branch_name}"
-        except subprocess.CalledProcessError as e:
-            return False, f"Failed to create branch: {e.stderr}"
-    
-    def apply_changes(self, repo_dir: str, changes: List[Dict]) -> Tuple[bool, str, List[str]]:
-        """Apply file changes to the repository"""
-        modified_files = []
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'token {token}',
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'self-healing-pipeline/1.0'
+        })
         
-        try:
-            for change in changes:
-                # Handle both absolute and relative file paths
-                file_rel_path = change["file"]
+    def _make_request(self, method: str, url: str, data: Optional[Dict] = None, 
+                     max_retries: int = 3) -> requests.Response:
+        """Make GitHub API request with rate limit handling and retries"""
+        for attempt in range(max_retries + 1):
+            try:
+                if method.upper() == 'GET':
+                    response = self.session.get(url, params=data)
+                elif method.upper() == 'POST':
+                    response = self.session.post(url, json=data)
+                elif method.upper() == 'PUT':
+                    response = self.session.put(url, json=data)
+                elif method.upper() == 'DELETE':
+                    response = self.session.delete(url)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
                 
-                # Normalize the path (resolve ../ and ./)
-                if file_rel_path.startswith('../'):
-                    # Remove leading ../ sequences - AI often provides paths relative to context dir
-                    normalized_path = file_rel_path
-                    while normalized_path.startswith('../'):
-                        normalized_path = normalized_path[3:]
-                    file_rel_path = normalized_path
-                
-                print(f"Looking for file: {file_rel_path}")
-                
-                # If the path doesn't start with repo_dir, it's a relative path
-                if not file_rel_path.startswith(repo_dir):
-                    # First try the direct relative path from repo root
-                    direct_path = os.path.join(repo_dir, file_rel_path)
-                    if os.path.exists(direct_path):
-                        file_path = direct_path
-                        print(f"Found file at direct path: {file_path}")
-                    else:
-                        # Try to find the file by matching directory and filename pattern
-                        file_path = None
-                        target_dir = os.path.dirname(file_rel_path)
-                        target_filename = os.path.basename(file_rel_path)
-                        
-                        print(f"Searching for {target_filename} in directory pattern: {target_dir}")
-                        
-                        for root, dirs, files in os.walk(repo_dir):
-                            rel_dir = os.path.relpath(root, repo_dir)
-                            
-                            # Check if this directory matches the target directory
-                            if rel_dir == target_dir or rel_dir.endswith(target_dir):
-                                # Look for exact filename match first
-                                if target_filename in files:
-                                    full_path = os.path.join(root, target_filename)
-                                    file_path = full_path
-                                    print(f"Found exact match: {file_path}")
-                                    break
-                                
-                                # If not found, try similar filenames (e.g., vars.tf for variables.tf)
-                                for file in files:
-                                    if file.endswith('.tf') and target_filename.endswith('.tf'):
-                                        # Check for common variations
-                                        if (file == 'vars.tf' and target_filename == 'variables.tf') or \
-                                           (file == 'variables.tf' and target_filename == 'vars.tf'):
-                                            full_path = os.path.join(root, file)
-                                            file_path = full_path
-                                            print(f"Found similar file: {file_path} (looking for {target_filename})")
-                                            break
-                                
-                                if file_path:
-                                    break
-                        
-                        # If still not found, try broader search
-                        if not file_path:
-                            print(f"Broader search for any file matching: {target_filename}")
-                            for root, dirs, files in os.walk(repo_dir):
-                                for file in files:
-                                    full_path = os.path.join(root, file)
-                                    rel_from_repo = os.path.relpath(full_path, repo_dir)
-                                    if rel_from_repo == file_rel_path or rel_from_repo.endswith(file_rel_path):
-                                        file_path = full_path
-                                        print(f"Found via broader search: {file_path}")
-                                        break
-                                if file_path:
-                                    break
+                # Check for rate limiting
+                if response.status_code == 403 and 'rate limit' in response.text.lower():
+                    reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+                    current_time = int(time.time())
+                    wait_time = max(reset_time - current_time, 60)  # Wait at least 60 seconds
                     
-                    if not file_path:
-                        print(f"❌ Could not find file: {file_rel_path} in {repo_dir}")
-                        print(f"Searched for: {target_filename} in directory: {target_dir}")
-                        return False, f"Could not find file: {file_rel_path} in {repo_dir}", modified_files
+                    print(f"⚠️ GitHub API rate limit hit. Attempt {attempt + 1}/{max_retries + 1}")
+                    print(f"Rate limit resets at: {datetime.fromtimestamp(reset_time, timezone.utc)}")
+                    
+                    if attempt < max_retries:
+                        print(f"Waiting {wait_time} seconds before retry...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise GitHubRateLimitError(
+                            f"GitHub API rate limit exceeded. Reset time: {reset_time}",
+                            reset_time
+                        )
+                
+                # Check for secondary rate limiting (abuse detection)
+                elif response.status_code == 403 and 'abuse' in response.text.lower():
+                    wait_time = min(60 * (2 ** attempt), 300)  # Exponential backoff, max 5 minutes
+                    
+                    print(f"⚠️ GitHub abuse detection triggered. Attempt {attempt + 1}/{max_retries + 1}")
+                    
+                    if attempt < max_retries:
+                        print(f"Waiting {wait_time} seconds before retry...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise GitHubRateLimitError(
+                            "GitHub abuse detection triggered. Please wait before making more requests."
+                        )
+                
+                # Check rate limit headers and warn if approaching limit
+                remaining = int(response.headers.get('X-RateLimit-Remaining', 1))
+                if remaining < 100:
+                    reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+                    reset_datetime = datetime.fromtimestamp(reset_time, timezone.utc)
+                    print(f"⚠️ GitHub API rate limit warning: {remaining} requests remaining")
+                    print(f"Rate limit resets at: {reset_datetime}")
+                
+                # For other 4xx/5xx errors, don't retry immediately
+                if response.status_code >= 400:
+                    if attempt < max_retries and response.status_code >= 500:
+                        wait_time = min(10 * (2 ** attempt), 60)  # Exponential backoff for server errors
+                        print(f"⚠️ Server error {response.status_code}. Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        response.raise_for_status()
+                
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    wait_time = min(5 * (2 ** attempt), 30)  # Exponential backoff
+                    print(f"⚠️ Request failed: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
                 else:
-                    file_path = file_rel_path
-                
-                action = change["action"]
-                
-                if action == "replace":
-                    success, msg = self._replace_content(
-                        file_path,
-                        change["old_content"],
-                        change["new_content"]
-                    )
-                elif action == "add":
-                    success, msg = self._add_content(file_path, change["new_content"])
-                elif action == "remove":
-                    success, msg = self._remove_content(file_path, change["old_content"])
-                else:
-                    return False, f"Unknown action: {action}", []
-                
-                if not success:
-                    return False, msg, modified_files
-                
-                # Store relative path from repo root for git operations
-                modified_files.append(os.path.relpath(file_path, repo_dir))
+                    raise
+        
+        raise Exception(f"Failed to complete request after {max_retries + 1} attempts")
+    
+    def download_artifact(self, repo: str, run_id: str, artifact_name: str, download_path: str) -> bool:
+        """Download artifact from GitHub Actions run"""
+        try:
+            print(f"📥 Downloading artifact '{artifact_name}' from run {run_id}")
             
-            return True, f"Applied {len(changes)} change(s)", modified_files
-        
+            # List artifacts for the run
+            artifacts_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
+            response = self._make_request('GET', artifacts_url)
+            artifacts = response.json()
+            
+            # Find the specific artifact
+            artifact = None
+            for art in artifacts['artifacts']:
+                if art['name'] == artifact_name:
+                    artifact = art
+                    break
+            
+            if not artifact:
+                print(f"❌ Artifact '{artifact_name}' not found in run {run_id}")
+                return False
+            
+            # Download the artifact
+            download_url = artifact['archive_download_url']
+            response = self._make_request('GET', download_url)
+            
+            # Save to file
+            os.makedirs(os.path.dirname(download_path), exist_ok=True)
+            with open(download_path, 'wb') as f:
+                f.write(response.content)
+            
+            print(f"✅ Artifact downloaded to: {download_path}")
+            return True
+            
         except Exception as e:
-            return False, f"Error applying changes: {str(e)}", modified_files
+            print(f"❌ Failed to download artifact: {e}")
+            return False
     
-    def _replace_content(self, file_path: str, old_content: str, new_content: str) -> Tuple[bool, str]:
-        """Replace content in a file"""
-        if not os.path.exists(file_path):
-            return False, f"File not found: {file_path}"
-        
-        with open(file_path, 'r') as f:
-            content = f.read()
-        
-        if old_content not in content:
-            return False, f"Old content not found in {file_path}"
-        
-        new_file_content = content.replace(old_content, new_content)
-        
-        with open(file_path, 'w') as f:
-            f.write(new_file_content)
-        
-        return True, f"Replaced content in {file_path}"
+    def clone_repository(self, repo: str, ref: str, clone_path: str) -> bool:
+        """Clone repository to local path"""
+        try:
+            if os.path.exists(clone_path):
+                subprocess.run(['rm', '-rf', clone_path], check=True)
+            
+            clone_url = f"https://{self.token}@github.com/{repo}.git"
+            cmd = ['git', 'clone', '--branch', ref.replace('refs/heads/', ''), clone_url, clone_path]
+            
+            print(f"📦 Cloning {repo}@{ref} to {clone_path}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0:
+                print(f"✅ Repository cloned successfully")
+                return True
+            else:
+                print(f"❌ Clone failed: {result.stderr}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"❌ Clone timed out after 5 minutes")
+            return False
+        except Exception as e:
+            print(f"❌ Clone failed: {e}")
+            return False
     
-    def _add_content(self, file_path: str, new_content: str) -> Tuple[bool, str]:
-        """Add content to a file"""
-        with open(file_path, 'a') as f:
-            f.write(f"\n{new_content}\n")
-        
-        return True, f"Added content to {file_path}"
+    def create_branch(self, repo_path: str, branch_name: str, base_branch: str = None) -> bool:
+        """Create and checkout a new branch"""
+        try:
+            os.chdir(repo_path)
+            
+            if base_branch:
+                subprocess.run(['git', 'checkout', base_branch], check=True)
+            
+            result = subprocess.run(['git', 'checkout', '-b', branch_name], 
+                                  capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print(f"✅ Created and checked out branch: {branch_name}")
+                return True
+            else:
+                print(f"❌ Failed to create branch: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Failed to create branch: {e}")
+            return False
     
-    def _remove_content(self, file_path: str, content_to_remove: str) -> Tuple[bool, str]:
-        """Remove content from a file"""
-        if not os.path.exists(file_path):
-            return False, f"File not found: {file_path}"
-        
-        with open(file_path, 'r') as f:
-            content = f.read()
-        
-        new_content = content.replace(content_to_remove, "")
-        
-        with open(file_path, 'w') as f:
-            f.write(new_content)
-        
-        return True, f"Removed content from {file_path}"
-    
-    def commit_and_push(self, repo_dir: str, message: str, files: List[str], branch: str) -> Tuple[bool, str, str]:
+    def commit_and_push(self, repo_path: str, message: str, branch: str) -> bool:
         """Commit changes and push to remote"""
         try:
-            # Configure git user identity
-            subprocess.run(
-                ["git", "config", "user.name", "AI Healing Agent"],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True
-            )
-            subprocess.run(
-                ["git", "config", "user.email", "ai-agent@devops.local"],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True
-            )
+            os.chdir(repo_path)
             
-            # Stage files
-            for file in files:
-                subprocess.run(
-                    ["git", "add", file],
-                    cwd=repo_dir,
-                    check=True
-                )
+            # Add all changes
+            subprocess.run(['git', 'add', '.'], check=True)
             
-            # Commit
-            subprocess.run(
-                ["git", "commit", "-m", message],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True
-            )
+            # Check if there are changes to commit
+            result = subprocess.run(['git', 'diff', '--cached', '--quiet'], 
+                                  capture_output=True)
+            if result.returncode == 0:
+                print("ℹ️ No changes to commit")
+                return True
             
-            # Get commit SHA
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            commit_sha = result.stdout.strip()
+            # Commit changes
+            subprocess.run(['git', 'commit', '-m', message], check=True)
             
-            # Push
-            push_url = f"https://{self.token}@github.com/{self.source_repo}.git"
-            subprocess.run(
-                ["git", "push", push_url, branch],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True
-            )
-            
-            return True, "Changes committed and pushed", commit_sha
-        
-        except subprocess.CalledProcessError as e:
-            return False, f"Git operation failed: {e.stderr}", ""
-    
-    def trigger_workflow(self, workflow_id: str, ref: str, inputs: Dict = None) -> Tuple[bool, str]:
-        """Trigger a workflow in the source repository"""
-        url = f"{self.api_base}/repos/{self.source_repo}/actions/workflows/{workflow_id}/dispatches"
-        
-        payload = {
-            "ref": ref,
-            "inputs": inputs or {}
-        }
-        
-        response = requests.post(url, headers=self.headers, json=payload)
-        
-        if response.status_code == 204:
-            return True, "Workflow triggered successfully"
-        else:
-            return False, f"Failed to trigger workflow: {response.text}"
-    
-    def create_pull_request(self, title: str, head: str, base: str, body: str) -> Tuple[bool, str, int]:
-        """Create a pull request"""
-        url = f"{self.api_base}/repos/{self.source_repo}/pulls"
-        
-        payload = {
-            "title": title,
-            "head": head,
-            "base": base,
-            "body": body
-        }
-        
-        response = requests.post(url, headers=self.headers, json=payload)
-        
-        if response.status_code == 201:
-            pr_number = response.json()["number"]
-            return True, f"PR #{pr_number} created", pr_number
-        else:
-            return False, f"Failed to create PR: {response.text}", 0
-    
-    def get_workflow_runs(self, workflow_id: str, branch: str, limit: int = 5) -> List[Dict]:
-        """Get recent workflow runs for a branch"""
-        url = f"{self.api_base}/repos/{self.source_repo}/actions/workflows/{workflow_id}/runs"
-        params = {
-            "branch": branch,
-            "per_page": limit
-        }
-        
-        response = requests.get(url, headers=self.headers, params=params)
-        
-        if response.status_code == 200:
-            return response.json().get("workflow_runs", [])
-        else:
-            return []
-    
-    def wait_for_workflow_completion(self, run_id: int, timeout: int = 600, poll_interval: int = 30) -> Tuple[bool, str]:
-        """Wait for a workflow run to complete"""
-        url = f"{self.api_base}/repos/{self.source_repo}/actions/runs/{run_id}"
-        
-        import time
-        elapsed = 0
-        
-        while elapsed < timeout:
-            response = requests.get(url, headers=self.headers)
-            
-            if response.status_code == 200:
-                run_data = response.json()
-                status = run_data["status"]
-                conclusion = run_data.get("conclusion")
-                
-                if status == "completed":
-                    if conclusion == "success":
-                        return True, "Workflow completed successfully"
+            # Push with rate limit awareness
+            max_push_retries = 3
+            for attempt in range(max_push_retries):
+                try:
+                    subprocess.run(['git', 'push', 'origin', branch], check=True, timeout=300)
+                    print(f"✅ Committed and pushed to {branch}")
+                    return True
+                except subprocess.TimeoutExpired:
+                    if attempt < max_push_retries - 1:
+                        print(f"⚠️ Push timed out. Retrying... ({attempt + 1}/{max_push_retries})")
+                        time.sleep(10)
+                        continue
                     else:
-                        return False, f"Workflow failed with conclusion: {conclusion}"
-            
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-        
-        return False, "Workflow timeout"
+                        print(f"❌ Push failed after {max_push_retries} attempts")
+                        return False
+                except subprocess.CalledProcessError as e:
+                    if 'rate limit' in str(e).lower() and attempt < max_push_retries - 1:
+                        print(f"⚠️ Git push rate limited. Waiting 60s... ({attempt + 1}/{max_push_retries})")
+                        time.sleep(60)
+                        continue
+                    else:
+                        print(f"❌ Push failed: {e}")
+                        return False
+                        
+        except Exception as e:
+            print(f"❌ Commit and push failed: {e}")
+            return False
     
-    def comment_on_pr(self, pr_number: int, comment: str) -> Tuple[bool, str]:
-        """Add a comment to a pull request"""
-        url = f"{self.api_base}/repos/{self.source_repo}/issues/{pr_number}/comments"
+    def trigger_workflow(self, repo: str, workflow: str, ref: str, inputs: Dict[str, Any] = None) -> Optional[str]:
+        """Trigger a workflow in the repository"""
+        try:
+            url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/dispatches"
+            
+            data = {
+                'ref': ref.replace('refs/heads/', ''),
+                'inputs': inputs or {}
+            }
+            
+            print(f"🚀 Triggering workflow '{workflow}' on {ref}")
+            response = self._make_request('POST', url, data)
+            
+            if response.status_code == 204:
+                print(f"✅ Workflow triggered successfully")
+                
+                # Wait a bit for the run to start, then find it
+                time.sleep(10)
+                return self._find_latest_run(repo, workflow, ref.replace('refs/heads/', ''))
+            else:
+                print(f"❌ Failed to trigger workflow: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Failed to trigger workflow: {e}")
+            return None
+    
+    def _find_latest_run(self, repo: str, workflow: str, branch: str) -> Optional[str]:
+        """Find the latest workflow run for a specific branch"""
+        try:
+            url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/runs"
+            params = {'branch': branch, 'per_page': 10}
+            
+            response = self._make_request('GET', url, params)
+            runs = response.json()
+            
+            if runs['workflow_runs']:
+                latest_run = runs['workflow_runs'][0]
+                return str(latest_run['id'])
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Failed to find latest run: {e}")
+            return None
+    
+    def monitor_workflow_run(self, repo: str, run_id: str, timeout_minutes: int = 15) -> Dict[str, Any]:
+        """Monitor workflow run until completion"""
+        start_time = time.time()
+        timeout_seconds = timeout_minutes * 60
         
-        payload = {"body": comment}
+        print(f"👀 Monitoring workflow run {run_id} (timeout: {timeout_minutes}min)")
         
-        response = requests.post(url, headers=self.headers, json=payload)
+        while time.time() - start_time < timeout_seconds:
+            try:
+                url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}"
+                response = self._make_request('GET', url)
+                run_data = response.json()
+                
+                status = run_data['status']
+                conclusion = run_data.get('conclusion')
+                
+                print(f"⏳ Status: {status}, Conclusion: {conclusion or 'pending'}")
+                
+                if status == 'completed':
+                    return {
+                        'success': conclusion == 'success',
+                        'status': status,
+                        'conclusion': conclusion,
+                        'run_data': run_data
+                    }
+                
+                # Check rate limit and adjust sleep time accordingly
+                remaining = int(response.headers.get('X-RateLimit-Remaining', 1000))
+                if remaining < 10:
+                    sleep_time = 60  # Sleep longer when approaching rate limit
+                else:
+                    sleep_time = 30
+                    
+                time.sleep(sleep_time)
+                
+            except GitHubRateLimitError as e:
+                print(f"⚠️ Rate limited while monitoring. Waiting...")
+                if e.reset_time:
+                    wait_time = max(e.reset_time - int(time.time()), 60)
+                    time.sleep(wait_time)
+                else:
+                    time.sleep(60)
+                continue
+            except Exception as e:
+                print(f"❌ Error monitoring workflow: {e}")
+                time.sleep(30)
+                continue
         
-        if response.status_code == 201:
-            return True, "Comment added"
-        else:
-            return False, f"Failed to add comment: {response.text}"
-
+        print(f"⏰ Monitoring timed out after {timeout_minutes} minutes")
+        return {'success': False, 'status': 'timeout', 'conclusion': 'timeout'}
+    
+    def create_pull_request(self, repo: str, head: str, base: str, title: str, body: str) -> Optional[Dict]:
+        """Create a pull request"""
+        try:
+            url = f"https://api.github.com/repos/{repo}/pulls"
+            
+            data = {
+                'title': title,
+                'head': head,
+                'base': base,
+                'body': body
+            }
+            
+            print(f"📋 Creating PR: {head} → {base}")
+            response = self._make_request('POST', url, data)
+            
+            if response.status_code == 201:
+                pr_data = response.json()
+                print(f"✅ PR created: {pr_data['html_url']}")
+                return pr_data
+            else:
+                print(f"❌ Failed to create PR: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Failed to create PR: {e}")
+            return None
 
 def main():
-    """Main entry point"""
+    """Main function for testing"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="GitHub integration for self-healing")
-    parser.add_argument("--token", required=True, help="GitHub token")
-    parser.add_argument("--repo", required=True, help="Source repository (owner/repo)")
-    parser.add_argument("--action", required=True, 
-                       choices=["apply-fix", "trigger-workflow", "check-workflow", "check-latest-workflow", "create-pr"])
-    parser.add_argument("--fix-file", help="Path to fix JSON file")
-    parser.add_argument("--source-dir", help="Path to source repository")
-    parser.add_argument("--branch-name", help="Branch name")
-    parser.add_argument("--base-branch", help="Base branch name")
-    parser.add_argument("--commit-message", help="Commit message")
-    parser.add_argument("--workflow", help="Workflow ID or filename")
-    parser.add_argument("--ref", help="Git reference")
-    parser.add_argument("--inputs", help="Workflow inputs as JSON string")
-    parser.add_argument("--branch", help="Branch to check")
-    parser.add_argument("--head", help="PR head branch")
-    parser.add_argument("--base", help="PR base branch")
-    parser.add_argument("--title", help="PR title")
-    parser.add_argument("--body", help="PR body")
-    parser.add_argument("--output", help="Output file for results")
+    parser = argparse.ArgumentParser(description='GitHub Integration Script')
+    parser.add_argument('--token', required=True, help='GitHub token')
+    parser.add_argument('--repo', required=True, help='Repository (owner/name)')
+    parser.add_argument('--action', required=True, choices=[
+        'download-artifact', 'clone', 'trigger-workflow', 'monitor-run', 'create-pr'
+    ])
     
     args = parser.parse_args()
     
-    gh = GitHubIntegration(args.token, args.repo)
-    result = {}
+    gh = GitHubIntegration(args.token)
     
-    try:
-        if args.action == "apply-fix":
-            # Load fix file
-            with open(args.fix_file, 'r') as f:
-                fix_data = json.load(f)
-            
-            if not fix_data.get("success"):
-                result = {"success": False, "message": "Fix data indicates failure"}
-            else:
-                # Apply changes directly to current branch (no new branch creation)
-                changes = fix_data.get("fix", {}).get("changes", [])
-                success, msg, files = gh.apply_changes(args.source_dir, changes)
-                
-                if not success:
-                    result = {"success": False, "message": msg}
-                else:
-                    # Commit and push to the same branch
-                    success, msg, commit_sha = gh.commit_and_push(
-                        args.source_dir, args.commit_message, files, args.branch_name
-                    )
-                    
-                    if success:
-                        result = {
-                            "success": True,
-                            "message": msg,
-                            "commit_sha": commit_sha,
-                            "files_modified": files
-                        }
-                    else:
-                        result = {"success": False, "message": msg}
-        
-        elif args.action == "trigger-workflow":
-            inputs = json.loads(args.inputs) if args.inputs else {}
-            success, msg = gh.trigger_workflow(args.workflow, args.ref, inputs)
-            result = {"success": success, "message": msg}
-        
-        elif args.action == "check-workflow":
-            runs = gh.get_workflow_runs(args.workflow, args.branch, limit=1)
-            if runs:
-                run = runs[0]
-                result = {
-                    "success": run["conclusion"] == "success",
-                    "status": run["status"],
-                    "conclusion": run.get("conclusion"),
-                    "run_id": run["id"],
-                    "html_url": run.get("html_url")
-                }
-            else:
-                result = {"success": False, "message": "No workflow runs found"}
-        
-        elif args.action == "check-latest-workflow":
-            # Get the latest workflow run for the branch (any workflow)
-            url = f"{gh.api_base}/repos/{gh.source_repo}/actions/runs"
-            params = {
-                "branch": args.branch,
-                "per_page": 5,
-                "event": "push"  # Only check push events (not PR events)
-            }
-            
-            response = requests.get(url, headers=gh.headers, params=params)
-            
-            if response.status_code == 200:
-                runs = response.json().get("workflow_runs", [])
-                if runs:
-                    # Get the most recent run
-                    run = runs[0]
-                    result = {
-                        "success": run["conclusion"] == "success" if run["conclusion"] else False,
-                        "status": run["status"],
-                        "conclusion": run.get("conclusion"),
-                        "run_id": run["id"],
-                        "html_url": run.get("html_url"),
-                        "workflow_name": run.get("name"),
-                        "created_at": run.get("created_at")
-                    }
-                else:
-                    result = {"success": False, "message": "No workflow runs found for branch"}
-            else:
-                result = {"success": False, "message": f"API error: {response.status_code}"}
-        
-        elif args.action == "create-pr":
-            success, msg, pr_number = gh.create_pull_request(
-                args.title, args.head, args.base, args.body
-            )
-            result = {"success": success, "message": msg, "pr_number": pr_number}
-        
-        # Write output
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(result, f, indent=2)
-        
-        print(json.dumps(result, indent=2))
-        
-        # For check-latest-workflow, exit 0 if we found a run (even if it's not successful yet)
-        # Exit 1 only if we couldn't find any run
-        if args.action == "check-latest-workflow":
-            sys.exit(0 if "status" in result else 1)
-        else:
-            sys.exit(0 if result.get("success", False) else 1)
+    if args.action == 'download-artifact':
+        # Example usage
+        success = gh.download_artifact(args.repo, '123456', 'error-logs', './error-logs.zip')
+        sys.exit(0 if success else 1)
     
-    except Exception as e:
-        error_result = {"success": False, "message": str(e)}
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(error_result, f, indent=2)
-        print(json.dumps(error_result, indent=2))
-        sys.exit(1)
+    print("GitHub Integration Script ready")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
